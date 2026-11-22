@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
@@ -32,10 +34,23 @@ from ..keyboards import (
 )
 from ..services import format_help
 from .commands import WELCOME
-from .searcher import dict_to_location, send_report
+from .searcher import dict_to_location, location_to_dict, send_report
 from .states import RoadStates
 
 router = Router()
+
+_DATE_WORDS = (
+    "امروز", "فردا", "پسفردا", "پس فردا", "شنبه", "یکشنبه", "یک شنبه",
+    "دوشنبه", "سهشنبه", "سه شنبه", "چهارشنبه", "چهار شنبه",
+    "پنجشنبه", "پنج شنبه", "جمعه",
+)
+
+
+def _looks_like_date(text: str) -> bool:
+    value = (text or "").strip()
+    if any(word in value for word in _DATE_WORDS):
+        return True
+    return "/" in value and bool(re.search(r"\d", value))
 
 
 def _owner_of_city(city: City) -> Province | None:
@@ -182,8 +197,16 @@ async def cb_road(call: CallbackQuery, callback_data: RoadCD, state: FSMContext)
     await state.update_data(road_id=road.id)
     await call.answer()
     location = Location(province=province.name, city=city.name, road=road.name)
-    await state.set_state(RoadStates.done)
-    await send_report(call.message, location, state)
+    await state.update_data(pending_location=location_to_dict(location))
+    await state.set_state("date")
+    await call.message.edit_text(
+        "🗓️ برای چه تاریخی وضعیت را بیاورم؟\n\n"
+        "مثلاً بنویس:\n"
+        "• امروز / فردا / پسفردا\n"
+        "• دوشنبه / سهشنبه / جمعه\n"
+        "• یا تاریخ مشخص مثل ۱۴۰۵/۰۹/۲۵",
+        reply_markup=main_menu(),
+    )
 
 
 # ---------- متن آزاد ----------
@@ -197,6 +220,25 @@ async def handle_text(message: Message, state: FSMContext) -> None:
 
     current = await state.get_state()
     data = await state.get_data()
+
+    if current == RoadStates.done.state and _looks_like_date(text):
+        last_location = dict_to_location(data.get("last_location"))
+        if last_location is not None:
+            last_location.date_text = text
+            await send_report(message, last_location, state)
+            return
+
+    if current == "date":
+        pending = dict_to_location(data.get("pending_location"))
+        if pending is None:
+            await state.set_state(RoadStates.province)
+            await message.answer("📍 استان را انتخاب کنید:", reply_markup=provinces_kb())
+            return
+        pending.date_text = text
+        await state.set_state(RoadStates.done)
+        await send_report(message, pending, state)
+        return
+
     province, city, road, current_province = _extract(text, data)
 
     if current == RoadStates.province.state:
